@@ -2,6 +2,7 @@ const std = @import("std");
 const fs = std.fs;
 const blake3 = std.crypto.hash.Blake3;
 const crc32 = std.hash.Crc32;
+const testing = std.testing;
 
 const File = fs.File;
 
@@ -51,7 +52,7 @@ pub fn create_ecc_file_with_datausage(usage: f32, file_path: []const u8, target_
 
 pub fn create_ecc_file_with_coverage(coverage: f32, file_path: []const u8, target_file_path: ?[]const u8) !void {
     if (coverage <= 0.0) {
-        return error.ConverageMustBePositive;
+        return error.CoverageMustBePositive;
     }
     if (coverage > 1.0) {
         return error.CoverageMustNotBeLargerThanOne;
@@ -65,6 +66,26 @@ pub fn create_ecc_file_with_dim(dim: u32, file_path: []const u8, target_file_pat
     const file = try fs.cwd().openFile(file_path, .{.mode = .read_only});
     defer file.close();
     try create_ecc_file_with_dim_intern(dim, file, file_path, target_file_path);
+}
+
+pub fn validate_pars_file(target_file_path: []const u8) !void {
+    var file = try fs.cwd().openFile(target_file_path, .{.mode = .read_only});
+    const fileSize = try file.getEndPos();
+    if (fileSize < 20) {
+        return error.InvalidParsFile;
+    }
+    var file_marker_buffer: [4]u8 = undefined;
+    _ = try file.pread(file_marker_buffer[0..], 0);
+    if (!std.mem.eql(u8, "PARS", file_marker_buffer[0..])) {
+        return error.InvalidParsFile;
+    }
+    _ = try file.pread(file_marker_buffer[0..], fileSize - 4);
+    if (!std.mem.eql(u8, "SRAP", file_marker_buffer[0..])) {
+        return error.InvalidParsFile;
+    }
+
+    try file.seekTo(0);
+
 }
 
 fn create_ecc_file_with_dim_intern(dim: u32, file: File, file_path: []const u8, target_file_path: ?[]const u8) !void {
@@ -83,21 +104,32 @@ fn create_ecc_file_with_dim_intern(dim: u32, file: File, file_path: []const u8, 
     }
 
     var target_path: []const u8 = undefined;
+    var allocated_path: ?[]u8 = null;
+
     if (target_file_path != null) {
         target_path = target_file_path.?;
     } else {
-        target_path = try default_allocator.alloc(u8, file_path.len + ".pars".len);
-        target_path = "temp.file";
+        allocated_path = try default_allocator.alloc(u8, file_path.len + ".pars".len);
+        std.mem.copy(u8, allocated_path.?[0..], file_path);
+        std.mem.copy(u8, allocated_path.?[file_path.len..], ".pars");
+        target_path = allocated_path.?;
     }
+    defer if (allocated_path != null) default_allocator.free(allocated_path.?);
 
     // Overwrites existing file
     const target_file = try fs.cwd().createFile(target_path, .{});
     defer target_file.close();
 
+    var relative_file_path: []u8 = try fs.path.relative(default_allocator, target_path, file_path);
+    std.mem.replaceScalar(u8, relative_file_path, '\\', '/');
+    defer default_allocator.free(relative_file_path);
+
+
+    // Relative path has a ".." at the start, slice into a "." for same dir
     var file_header = FileHeader {
         .file_size = size,
-        .file_name_length = @intCast(file_path.len),
-        .file_name = file_path,
+        .file_name_length = @intCast(relative_file_path.len - 1),
+        .file_name = relative_file_path[1..],
         .blake3_hash = [1]u8{0} ** 16,
         .block_dim = used_dim,
         .full_size_block_count = full_size_block_count,
@@ -124,7 +156,7 @@ fn create_ecc_file_with_dim_intern(dim: u32, file: File, file_path: []const u8, 
         const file_block = file_block_opt.?;
         try write_block(target_file, file_block);
     }
-
+    _ = try target_file.write("SRAP");
 }
 
 fn calculate_blake3_hash(file: File, blake3_hash: *[16]u8) !void {
@@ -145,6 +177,11 @@ fn create_block(file: File, dim: u32, last_block_dim: u32, buffer: []u8, col_dat
    var block_dim = dim;
    if (read_size < buffer.len) {
        block_dim = last_block_dim;
+       if (last_block_dim + 1 < col_data.len) {
+            @memset(col_data[last_block_dim+1..], 0);
+            @memset(row_data[last_block_dim+1..], 0);
+       }
+
    }
 
    var crc: u32 = crc32.hash(buffer[0..read_size]);
