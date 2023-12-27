@@ -16,6 +16,12 @@ const FileHeader = struct {
     last_block_dim: u32,
     file_name_length: u16,
     file_name: []const u8,
+
+    fn get_total_blocks(self: *FileHeader) u64 {
+        var result = self.full_size_block_count;
+        if (result.last_block_dim > 0) result += 1;
+        return result;
+    }
 };
 
 const FileBlock = struct {
@@ -69,22 +75,40 @@ pub fn create_ecc_file_with_dim(dim: u32, file_path: []const u8, target_file_pat
 }
 
 pub fn validate_pars_file(target_file_path: []const u8) !void {
-    var file = try fs.cwd().openFile(target_file_path, .{.mode = .read_only});
-    const fileSize = try file.getEndPos();
-    if (fileSize < 20) {
-        return error.InvalidParsFile;
-    }
-    var file_marker_buffer: [4]u8 = undefined;
-    _ = try file.pread(file_marker_buffer[0..], 0);
-    if (!std.mem.eql(u8, "PARS", file_marker_buffer[0..])) {
-        return error.InvalidParsFile;
-    }
-    _ = try file.pread(file_marker_buffer[0..], fileSize - 4);
-    if (!std.mem.eql(u8, "SRAP", file_marker_buffer[0..])) {
-        return error.InvalidParsFile;
+    var par_file = try fs.cwd().openFile(target_file_path, .{.mode = .read_only});
+    var header = try get_header_block(par_file);
+    defer default_allocator.free(header.file_name);
+
+    const data_file_path = try get_data_file_path(target_file_path, header.file_name);
+    defer default_allocator.free(data_file_path);
+    var data_file = try fs.cwd().openFile(data_file_path, .{.mode = .read_only});
+
+    var data_file_hash: [16]u8 = undefined;
+    try calculate_blake3_hash(data_file, &data_file_hash);
+
+    // If hashes match, data is OK
+    if (std.mem.eql(u8, &data_file_hash, &header.blake3_hash)) {
+        return;
     }
 
-    try file.seekTo(0);
+    // We have work to do
+    try par_file.seekTo(46 + header.file_name_length);
+    try data_file.seekTo(0);
+
+    var data_block = try default_allocator.alloc(u8, header.block_dim*header.block_dim);
+    var parity_block = try default_allocator.alloc(u8, 2*header.block_dim + 4);
+    defer default_allocator.free(data_block);
+    defer default_allocator.free(parity_block);
+
+    var i: u64 = 0;
+    while (i < header.full_size_block_count): (i += 1) {
+        var data_read_size = try data_file.read(data_block);
+        var par_read_size = try par_file.read(parity_block);
+        std.debug.print("{d} {d} {d}\n", .{data_read_size, par_read_size, header.block_dim});
+        if (data_read_size == 0 or par_read_size == 0) break;
+        std.debug.print("{d}\n", .{crc32.hash(data_block[0..data_read_size])});
+    }
+    
 
 }
 
@@ -229,4 +253,72 @@ fn write_block(file: File, block: FileBlock) !void {
     _ = try file.write(std.mem.sliceAsBytes(&[1]u32{block.crc}));
     _ = try file.write(block.col[0..block.dim]);
     _ = try file.write(block.row[0..block.dim]);
+}
+
+fn get_header_block(file: File) !FileHeader{
+    const fileSize = try file.getEndPos();
+    if (fileSize < 20) {
+        return error.InvalidParsFile;
+    }
+    var file_marker_buffer: [4]u8 = undefined;
+    _ = try file.pread(file_marker_buffer[0..], 0);
+    if (!std.mem.eql(u8, "PARS", file_marker_buffer[0..])) {
+        return error.InvalidParsFile;
+    }
+    _ = try file.pread(file_marker_buffer[0..], fileSize - 4);
+    if (!std.mem.eql(u8, "SRAP", file_marker_buffer[0..])) {
+        return error.InvalidParsFile;
+    }
+
+    try file.seekTo(0);
+    // 46 bytes from starts is all header information except file length
+    var header_buffer: [46]u8 = undefined;
+    var read = try file.read(header_buffer[0..]);
+    _ = read;
+    var header: FileHeader = .{
+        .file_size = extract_u64(header_buffer[4..12].*),
+        .blake3_hash = undefined,
+        .block_dim = extract_u32(header_buffer[28..32].*),
+        .full_size_block_count = extract_u64(header_buffer[32..40].*),
+        .last_block_dim = extract_u32(header_buffer[40..44].*),
+        .file_name_length = extract_u16(header_buffer[44..46].*),
+        .file_name = undefined
+    };
+    std.mem.copy(u8, header.blake3_hash[0..], header_buffer[12..28]);
+    var file_name = try default_allocator.alloc(u8, @intCast(header.file_name_length));
+    _ = try file.read(file_name[0..]);
+    header.file_name = file_name;
+    return header;
+}
+
+fn extract_u16(input: [2]u8) u16{
+    var cast: *[1]u16 align(1) = @constCast(@alignCast(@ptrCast(&input)));
+    return cast[0];
+}
+
+fn extract_u32(input: [4]u8) u32{
+    var cast: *[1]u32 align(1) = @constCast(@alignCast(@ptrCast(&input)));
+    return cast[0];
+}
+
+fn extract_u64(input: [8]u8) u64{
+    var cast: *[1]u64 align(1) = @constCast(@alignCast(@ptrCast(&input)));
+    return cast[0];
+}
+
+fn get_data_file_path(pars_file_path: []const u8, data_file_path: []const u8) ![]u8 {
+    if (data_file_path[0] == '/') {
+        return try default_allocator.dupe(u8, data_file_path);
+    }
+    const last_slash_index = std.mem.lastIndexOfScalar(u8, pars_file_path, '/').?;
+    var result_size = last_slash_index + data_file_path.len + 1;
+    var data_file_start_index: usize = 0;
+    // if (std.mem.startsWith(u8, data_file_path, "./")) {
+    //     data_file_start_index = 2;
+    //     result_size -= 2;
+    // }
+    var result = try default_allocator.alloc(u8, result_size);
+    std.mem.copy(u8, result, pars_file_path[0..last_slash_index+1]);
+    std.mem.copy(u8, result[last_slash_index+1..], data_file_path[data_file_start_index..]);
+    return result;
 }
