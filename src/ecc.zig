@@ -22,6 +22,17 @@ const FileHeader = struct {
         if (result.last_block_dim > 0) result += 1;
         return result;
     }
+
+    fn file_size_matches(self: *FileHeader, file_size: usize) bool {
+        // Start and end file type marker + header size(without file name length)
+        var expected: usize = 4 + 8 + 16 + 4 + 8 + 4 + 2 + 4;
+        expected += self.file_name_length;
+        expected += ((self.block_dim * self.block_dim) + 4) * self.full_size_block_count;
+        if (self.last_block_dim > 0) {
+            expected += ((self.last_block_dim * self.last_block_dim) + 4);
+        }
+        return expected == file_size;
+    }
 };
 
 const FileBlock = struct {
@@ -29,6 +40,14 @@ const FileBlock = struct {
     col: []u8,
     row: []u8,
     dim: usize,
+};
+
+const VerificationResult = struct {
+    file_has_full_integrity: bool,
+    size_matches: bool,
+    total_blocks: u64,
+    faulty_blocks: u64,
+    fixable_faulty_blocks: u64
 };
 
 pub fn create_ecc_file_with_block_count(count: u64, file_path: []const u8, target_file_path: ?[]const u8) !void {
@@ -74,14 +93,24 @@ pub fn create_ecc_file_with_dim(dim: u32, file_path: []const u8, target_file_pat
     try create_ecc_file_with_dim_intern(dim, file, file_path, target_file_path);
 }
 
-pub fn validate_pars_file(target_file_path: []const u8) !void {
+pub fn validate_pars_file(target_file_path: []const u8, try_fix_data_file: bool) !void {
     var par_file = try fs.cwd().openFile(target_file_path, .{.mode = .read_only});
     var header = try get_header_block(par_file);
     defer default_allocator.free(header.file_name);
 
     const data_file_path = try get_data_file_path(target_file_path, header.file_name);
     defer default_allocator.free(data_file_path);
-    var data_file = try fs.cwd().openFile(data_file_path, .{.mode = .read_only});
+    var data_file = try fs.cwd().openFile(data_file_path, .{.mode = .read_write});
+
+    if (header.file_size_matches(try par_file.getEndPos())) {
+        return error.ParFileSizeMismatch;
+    }
+
+    // If the size is mismatched, any form of matching is potentially difficult
+    // Skip for now
+    if (try data_file.getEndPos() != header.file_size) {
+        return error.SizeMismatch;
+    }
 
     var data_file_hash: [16]u8 = undefined;
     try calculate_blake3_hash(data_file, &data_file_hash);
@@ -97,18 +126,111 @@ pub fn validate_pars_file(target_file_path: []const u8) !void {
 
     var data_block = try default_allocator.alloc(u8, header.block_dim*header.block_dim);
     var parity_block = try default_allocator.alloc(u8, 2*header.block_dim + 4);
+    var parity_col_match = try default_allocator.alloc(u8, header.block_dim);
+    var parity_row_match = try default_allocator.alloc(u8, header.block_dim);
+
     defer default_allocator.free(data_block);
     defer default_allocator.free(parity_block);
+    defer default_allocator.free(parity_col_match);
+    defer default_allocator.free(parity_row_match);
 
     var i: u64 = 0;
     while (i < header.full_size_block_count): (i += 1) {
-        var data_read_size = try data_file.read(data_block);
-        var par_read_size = try par_file.read(parity_block);
-        std.debug.print("{d} {d} {d}\n", .{data_read_size, par_read_size, header.block_dim});
-        if (data_read_size == 0 or par_read_size == 0) break;
-        std.debug.print("{d}\n", .{crc32.hash(data_block[0..data_read_size])});
+        const dim: usize = header.block_dim;
+        _ = try data_file.read(data_block);
+        _ = try par_file.read(parity_block);
+        const data_crc = crc32.hash(data_block[0..]);
+        const par_crc = extract_u32(parity_block[0..4].*);
+        // If parity doesn't match, then the data is not expected(perhaps corrupted)
+        // If parity matches, it might be dumb luck
+        if (data_crc == par_crc) continue;
+        var col_checks = parity_block[4..4+dim];
+        var row_checks = parity_block[4+dim..4+dim+dim];
+
+        var j: usize = 0;
+        var k: usize = 0;
+
+        while (j < header.block_dim): (j += 1) {
+            var xor: u8 = 0;
+            k = 0;
+            while (k < header.block_dim): (k += 1) {
+                const index: usize = (j * dim) + k;
+                xor ^= data_block[index];
+            }
+            parity_row_match[j] = xor;
+        }
+
+        j = 0;
+        k = 0;
+
+        while (k < dim): (k += 1) {
+            var xor: u8 = 0;
+            j = 0;
+            while (j < dim): (j += 1) {
+                const index: usize = (j * dim) + k;
+                xor ^= data_block[index];
+            }
+            parity_col_match[k] = xor;
+        }
+
+        var row_errors: u32 = 0;
+        var col_errors: u32 = 0;
+
+        var idx: usize = 0;
+        while (idx < dim): (idx += 1) {
+            if (row_checks[idx] != parity_row_match[idx]) {
+                row_errors += 1;
+            }
+            if (col_checks[idx] != parity_col_match[idx]) {
+                col_errors += 1;
+            }
+        }
+
+        // We have one byte error in a block
+        // Restoration should be trivial
+        if (try_fix_data_file and row_errors == 1 and col_errors == 1) {
+            var fix_row: usize = undefined;
+            var fix_column: usize = undefined;
+            idx = 0;
+            while (idx < dim): (idx += 1) {
+                if (row_checks[idx] != parity_row_match[idx]) {
+                    fix_row = idx;
+                    break;
+                }
+            }
+            idx = 0;
+            while (idx < dim): (idx += 1) {
+                if (col_checks[idx] != parity_col_match[idx]) {
+                    fix_column = idx;
+                    break;
+                }
+            }
+
+            const absolute_index : usize = (i * dim * dim) + (fix_row * dim) + fix_column;
+
+            var corrected_value: u8 = row_checks[fix_row];
+            idx = 0;
+            while (idx < dim): (idx += 1) {
+                const used_index = dim*fix_row + idx;
+                if (idx != fix_column) {
+                    corrected_value ^= data_block[used_index];
+                }
+            }
+
+            _ = try data_file.pwrite(&[1]u8{corrected_value}, absolute_index);
+        }
     }
-    
+
+    if (header.last_block_dim > 0) {
+        var data_read_size = try data_file.read(data_block);
+        _ = try par_file.read(parity_block);
+        const data_crc = crc32.hash(data_block[0..data_read_size]);
+        const par_crc = extract_u32(parity_block[0..4].*);
+        if (data_crc != par_crc) {
+
+        }
+
+    }
 
 }
 
@@ -313,10 +435,6 @@ fn get_data_file_path(pars_file_path: []const u8, data_file_path: []const u8) ![
     const last_slash_index = std.mem.lastIndexOfScalar(u8, pars_file_path, '/').?;
     var result_size = last_slash_index + data_file_path.len + 1;
     var data_file_start_index: usize = 0;
-    // if (std.mem.startsWith(u8, data_file_path, "./")) {
-    //     data_file_start_index = 2;
-    //     result_size -= 2;
-    // }
     var result = try default_allocator.alloc(u8, result_size);
     std.mem.copy(u8, result, pars_file_path[0..last_slash_index+1]);
     std.mem.copy(u8, result[last_slash_index+1..], data_file_path[data_file_start_index..]);
