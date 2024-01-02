@@ -136,102 +136,12 @@ pub fn validate_pars_file(target_file_path: []const u8, try_fix_data_file: bool)
 
     var i: u64 = 0;
     while (i < header.full_size_block_count): (i += 1) {
-        const dim: usize = header.block_dim;
-        _ = try data_file.read(data_block);
-        _ = try par_file.read(parity_block);
-        const data_crc = crc32.hash(data_block[0..]);
-        const par_crc = extract_u32(parity_block[0..4].*);
-        // If parity doesn't match, then the data is not expected(perhaps corrupted)
-        // If parity matches, it might be dumb luck
-        if (data_crc == par_crc) continue;
-        var col_checks = parity_block[4..4+dim];
-        var row_checks = parity_block[4+dim..4+dim+dim];
-
-        var j: usize = 0;
-        var k: usize = 0;
-
-        while (j < header.block_dim): (j += 1) {
-            var xor: u8 = 0;
-            k = 0;
-            while (k < header.block_dim): (k += 1) {
-                const index: usize = (j * dim) + k;
-                xor ^= data_block[index];
-            }
-            parity_row_match[j] = xor;
-        }
-
-        j = 0;
-        k = 0;
-
-        while (k < dim): (k += 1) {
-            var xor: u8 = 0;
-            j = 0;
-            while (j < dim): (j += 1) {
-                const index: usize = (j * dim) + k;
-                xor ^= data_block[index];
-            }
-            parity_col_match[k] = xor;
-        }
-
-        var row_errors: u32 = 0;
-        var col_errors: u32 = 0;
-
-        var idx: usize = 0;
-        while (idx < dim): (idx += 1) {
-            if (row_checks[idx] != parity_row_match[idx]) {
-                row_errors += 1;
-            }
-            if (col_checks[idx] != parity_col_match[idx]) {
-                col_errors += 1;
-            }
-        }
-
-        // We have one byte error in a block
-        // Restoration should be trivial
-        if (try_fix_data_file and row_errors == 1 and col_errors == 1) {
-            var fix_row: usize = undefined;
-            var fix_column: usize = undefined;
-            idx = 0;
-            while (idx < dim): (idx += 1) {
-                if (row_checks[idx] != parity_row_match[idx]) {
-                    fix_row = idx;
-                    break;
-                }
-            }
-            idx = 0;
-            while (idx < dim): (idx += 1) {
-                if (col_checks[idx] != parity_col_match[idx]) {
-                    fix_column = idx;
-                    break;
-                }
-            }
-
-            const absolute_index : usize = (i * dim * dim) + (fix_row * dim) + fix_column;
-
-            var corrected_value: u8 = row_checks[fix_row];
-            idx = 0;
-            while (idx < dim): (idx += 1) {
-                const used_index = dim*fix_row + idx;
-                if (idx != fix_column) {
-                    corrected_value ^= data_block[used_index];
-                }
-            }
-
-            _ = try data_file.pwrite(&[1]u8{corrected_value}, absolute_index);
-        }
+        try check_block(data_file, par_file, data_block, parity_block, parity_row_match, parity_col_match, i, header.block_dim, header.block_dim, try_fix_data_file);
     }
 
     if (header.last_block_dim > 0) {
-        var data_read_size = try data_file.read(data_block);
-        _ = try par_file.read(parity_block);
-        const data_crc = crc32.hash(data_block[0..data_read_size]);
-        const par_crc = extract_u32(parity_block[0..4].*);
-        if (data_crc != par_crc) {
-
-        }
-
+        try check_block(data_file, par_file, data_block, parity_block, parity_row_match, parity_col_match, header.full_size_block_count, header.block_dim, header.last_block_dim, try_fix_data_file);
     }
-
 }
 
 fn create_ecc_file_with_dim_intern(dim: u32, file: File, file_path: []const u8, target_file_path: ?[]const u8) !void {
@@ -358,6 +268,92 @@ fn create_block(file: File, dim: u32, last_block_dim: u32, buffer: []u8, col_dat
 
    var result = FileBlock{.crc = crc, .row = row_data, .col = col_data, .dim = block_dim};
    return result;
+}
+
+fn check_block(data_file: File, par_file: File, data_block: []u8, parity_block: []u8, parity_row_match: []u8, parity_col_match: []u8, block_index: u64, max_dim: u32, dim: u32, try_fix_data_file: bool) !void {
+    _ = try data_file.read(data_block);
+    _ = try par_file.read(parity_block);
+    const data_crc = crc32.hash(data_block[0..]);
+    const par_crc = extract_u32(parity_block[0..4].*);
+    // If parity doesn't match, then the data is not expected(perhaps corrupted)
+    // If parity matches, it might be dumb luck
+    if (data_crc == par_crc) return;
+    var col_checks = parity_block[4..4+dim];
+    var row_checks = parity_block[4+dim..4+dim+dim];
+
+    var j: usize = 0;
+    var k: usize = 0;
+
+    while (j < dim): (j += 1) {
+        var xor: u8 = 0;
+        k = 0;
+        while (k < dim): (k += 1) {
+            const index: usize = (j * dim) + k;
+            xor ^= data_block[index];
+        }
+        parity_row_match[j] = xor;
+    }
+
+    j = 0;
+    k = 0;
+
+    while (k < dim): (k += 1) {
+        var xor: u8 = 0;
+        j = 0;
+        while (j < dim): (j += 1) {
+            const index: usize = (j * dim) + k;
+            xor ^= data_block[index];
+        }
+        parity_col_match[k] = xor;
+    }
+
+    var row_errors: u32 = 0;
+    var col_errors: u32 = 0;
+
+    var idx: usize = 0;
+    while (idx < dim): (idx += 1) {
+        if (row_checks[idx] != parity_row_match[idx]) {
+            row_errors += 1;
+        }
+        if (col_checks[idx] != parity_col_match[idx]) {
+            col_errors += 1;
+        }
+    }
+
+    // We have one byte error in a block
+    // Restoration should be trivial
+    if (try_fix_data_file and row_errors == 1 and col_errors == 1) {
+        var fix_row: usize = undefined;
+        var fix_column: usize = undefined;
+        idx = 0;
+        while (idx < dim): (idx += 1) {
+            if (row_checks[idx] != parity_row_match[idx]) {
+                fix_row = idx;
+                break;
+            }
+        }
+        idx = 0;
+        while (idx < dim): (idx += 1) {
+            if (col_checks[idx] != parity_col_match[idx]) {
+                fix_column = idx;
+                break;
+            }
+        }
+
+        const absolute_index : usize = (block_index * max_dim * max_dim) + (fix_row * dim) + fix_column;
+
+        var corrected_value: u8 = row_checks[fix_row];
+        idx = 0;
+        while (idx < dim): (idx += 1) {
+            const used_index = dim*fix_row + idx;
+            if (idx != fix_column) {
+                corrected_value ^= data_block[used_index];
+            }
+        }
+
+        _ = try data_file.pwrite(&[1]u8{corrected_value}, absolute_index);
+    }
+
 }
 
 fn write_header(file: File, header: FileHeader) !void {
