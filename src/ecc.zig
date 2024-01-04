@@ -58,8 +58,7 @@ pub fn create_ecc_file_with_block_count(count: u64, file_path: []const u8, targe
     defer file.close();
     const size = try file.getEndPos();
     const block_size = size / count;
-    const block_size_float: f64 = @floatFromInt(block_size);
-    const target_dim: u32 = @intFromFloat(@ceil(@sqrt(block_size_float)));
+    const target_dim = get_smallest_dim_to_contain_size(block_size);
     create_ecc_file_with_dim_intern(target_dim, file, file_path, target_file_path);
 }
 
@@ -71,7 +70,8 @@ pub fn create_ecc_file_with_datausage(usage: f32, file_path: []const u8, target_
         return error.UsageMustNotBeLargerThanOne;
     }
 
-    const target_dim: u32 = @intFromFloat(@ceil(@sqrt(1/usage)));
+    const block_size = 1/usage;
+    const target_dim: u32 = get_smallest_dim_to_contain_size(block_size);
     try create_ecc_file_with_dim(target_dim, file_path, target_file_path);
 }
 
@@ -144,13 +144,21 @@ pub fn validate_pars_file(target_file_path: []const u8, try_fix_data_file: bool)
     }
 }
 
+pub fn get_pars_file_header(target_file_path: []const u8) !FileHeader {
+    var par_file = try fs.cwd().openFile(target_file_path, .{.mode = .read_only});
+    return try get_header_block(par_file);
+}
+
 fn create_ecc_file_with_dim_intern(dim: u32, file: File, file_path: []const u8, target_file_path: ?[]const u8) !void {
+    const size = try file.getEndPos();
     var used_dim = dim;
-    if (used_dim < 2) {
+    if (dim < 2) {
         used_dim = 2;
+    } else if (size / (dim * dim) == 0) {
+        used_dim = get_smallest_dim_to_contain_size(size);
     }
     const block_size = used_dim * used_dim;
-    const size = try file.getEndPos();
+
     var full_size_block_count: u64 = size / block_size;
 
     var last_block_size = size - (full_size_block_count * block_size);
@@ -407,6 +415,11 @@ fn get_header_block(file: File) !FileHeader{
     _ = try file.read(file_name[0..]);
     header.file_name = file_name;
     return header;
+}
+
+fn get_smallest_dim_to_contain_size(size: usize) u32 {
+    const block_size_float: f64 = @floatFromInt(size);
+    return @intFromFloat(@ceil(@sqrt(block_size_float)));
 }
 
 fn extract_u16(input: [2]u8) u16{
