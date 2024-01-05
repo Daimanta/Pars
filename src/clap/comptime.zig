@@ -46,8 +46,9 @@ pub fn ComptimeClap(
         pub fn parse(iter: anytype, opt: clap.ParseOptions) !@This() {
             const allocator = opt.allocator;
             var multis = [_]std.ArrayList([]const u8){undefined} ** multi_options;
-            for (multis) |*multi|
-                multi.* = std.ArrayList([]const u8).init(allocator);
+            for (0..multis.len) |i| {
+                multis[i] = std.ArrayList([]const u8).init(allocator);
+            }
 
             var pos = std.ArrayList([]const u8).init(allocator);
 
@@ -88,8 +89,9 @@ pub fn ComptimeClap(
                 }
             }
 
-            for (multis, 0..) |*multi, i|
-                res.multi_options[i] = multi.toOwnedSlice();
+            for (0..multis.len) |i| {
+                res.multi_options[i] = try multis[i].toOwnedSlice();
+            }
             res.pos = try pos.toOwnedSlice();
 
             return res;

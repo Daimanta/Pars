@@ -5,12 +5,13 @@ const crc32 = std.hash.Crc32;
 const testing = std.testing;
 
 const File = fs.File;
+const Allocator = std.mem.Allocator;
 
 const default_allocator = std.heap.page_allocator;
 
 const FileHeader = struct {
     file_size: u64,
-    blake3_hash: [16]u8,
+    blake3_hash: [32]u8,
     block_dim: u32,
     full_size_block_count: u64,
     last_block_dim: u32,
@@ -25,7 +26,7 @@ const FileHeader = struct {
 
     fn file_size_matches(self: *FileHeader, file_size: usize) bool {
         // Start and end file type marker + header size(without file name length)
-        var expected: usize = 4 + 8 + 16 + 4 + 8 + 4 + 2 + 4;
+        var expected: usize = 4 + 8 + 32 + 4 + 8 + 4 + 2 + 4;
         expected += self.file_name_length;
         expected += ((self.block_dim * self.block_dim) + 4) * self.full_size_block_count;
         if (self.last_block_dim > 0) {
@@ -57,7 +58,7 @@ pub fn create_ecc_file_with_block_count(count: u64, file_path: []const u8, targe
     const file = try fs.cwd().openFile(file_path, .{.mode = .read_only});
     defer file.close();
     const size = try file.getEndPos();
-    const block_size = size / count;
+    const block_size: usize = size / count;
     const target_dim = get_smallest_dim_to_contain_size(block_size);
     create_ecc_file_with_dim_intern(target_dim, file, file_path, target_file_path);
 }
@@ -70,7 +71,7 @@ pub fn create_ecc_file_with_datausage(usage: f32, file_path: []const u8, target_
         return error.UsageMustNotBeLargerThanOne;
     }
 
-    const block_size = 1/usage;
+    const block_size: usize = @intFromFloat(1/usage);
     const target_dim: u32 = get_smallest_dim_to_contain_size(block_size);
     try create_ecc_file_with_dim(target_dim, file_path, target_file_path);
 }
@@ -121,7 +122,7 @@ pub fn validate_pars_file(target_file_path: []const u8, try_fix_data_file: bool)
     }
 
     // We have work to do
-    try par_file.seekTo(46 + header.file_name_length);
+    try par_file.seekTo(62 + header.file_name_length);
     try data_file.seekTo(0);
 
     var data_block = try default_allocator.alloc(u8, header.block_dim*header.block_dim);
@@ -144,9 +145,9 @@ pub fn validate_pars_file(target_file_path: []const u8, try_fix_data_file: bool)
     }
 }
 
-pub fn get_pars_file_header(target_file_path: []const u8) !FileHeader {
+pub fn get_pars_file_header(target_file_path: []const u8, allocator: Allocator) !FileHeader {
     var par_file = try fs.cwd().openFile(target_file_path, .{.mode = .read_only});
-    return try get_header_block(par_file);
+    return try get_header_block(par_file, allocator);
 }
 
 fn create_ecc_file_with_dim_intern(dim: u32, file: File, file_path: []const u8, target_file_path: ?[]const u8) !void {
@@ -194,7 +195,7 @@ fn create_ecc_file_with_dim_intern(dim: u32, file: File, file_path: []const u8, 
         .file_size = size,
         .file_name_length = @intCast(relative_file_path.len - 1),
         .file_name = relative_file_path[1..],
-        .blake3_hash = [1]u8{0} ** 16,
+        .blake3_hash = [1]u8{0} ** 32,
         .block_dim = used_dim,
         .full_size_block_count = full_size_block_count,
         .last_block_dim = last_block_dim
@@ -223,7 +224,7 @@ fn create_ecc_file_with_dim_intern(dim: u32, file: File, file_path: []const u8, 
     _ = try target_file.write("SRAP");
 }
 
-fn calculate_blake3_hash(file: File, blake3_hash: *[16]u8) !void {
+fn calculate_blake3_hash(file: File, blake3_hash: *[32]u8) !void {
     var blake3_state = blake3.init(blake3.Options{});
     var blake_buffer = try default_allocator.alloc(u8, 1<<20);
     defer default_allocator.free(blake_buffer);
@@ -381,7 +382,7 @@ fn write_block(file: File, block: FileBlock) !void {
     _ = try file.write(block.row[0..block.dim]);
 }
 
-fn get_header_block(file: File) !FileHeader{
+fn get_header_block(file: File, allocator: Allocator) !FileHeader{
     const fileSize = try file.getEndPos();
     if (fileSize < 20) {
         return error.InvalidParsFile;
@@ -398,20 +399,19 @@ fn get_header_block(file: File) !FileHeader{
 
     try file.seekTo(0);
     // 46 bytes from starts is all header information except file length
-    var header_buffer: [46]u8 = undefined;
-    var read = try file.read(header_buffer[0..]);
-    _ = read;
+    var header_buffer: [62]u8 = undefined;
+    _ = try file.read(header_buffer[0..]);
     var header: FileHeader = .{
         .file_size = extract_u64(header_buffer[4..12].*),
         .blake3_hash = undefined,
-        .block_dim = extract_u32(header_buffer[28..32].*),
-        .full_size_block_count = extract_u64(header_buffer[32..40].*),
-        .last_block_dim = extract_u32(header_buffer[40..44].*),
-        .file_name_length = extract_u16(header_buffer[44..46].*),
+        .block_dim = extract_u32(header_buffer[44..48].*),
+        .full_size_block_count = extract_u64(header_buffer[48..56].*),
+        .last_block_dim = extract_u32(header_buffer[56..60].*),
+        .file_name_length = extract_u16(header_buffer[60..62].*),
         .file_name = undefined
     };
-    std.mem.copy(u8, header.blake3_hash[0..], header_buffer[12..28]);
-    var file_name = try default_allocator.alloc(u8, @intCast(header.file_name_length));
+    std.mem.copy(u8, header.blake3_hash[0..], header_buffer[12..44]);
+    var file_name = try allocator.alloc(u8, @intCast(header.file_name_length));
     _ = try file.read(file_name[0..]);
     header.file_name = file_name;
     return header;
