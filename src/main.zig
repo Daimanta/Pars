@@ -16,9 +16,10 @@ const Mode = enum {
 const params = [_]clap.Param(clap.Help){
     clap.parseParam("-c, --check <FILE>     Checks a parity file for data file consistency. Cannot be combined with -imw.") catch unreachable,
     clap.parseParam("--dir <DIR>    Standard dir location for creating parity files in watch mode. Default is '.'.") catch unreachable,
-    clap.parseParam("-f, --fix     Try to fix data errors found in data files based on parity files. Only works when checking a file.") catch unreachable,
+    clap.parseParam("-f, --fix     Try to fix data errors found in data files based on parity files. Only works when checking a file. Default: false") catch unreachable,
     clap.parseParam("-i, --info <FILE>     Gets header statistics from a parity file. Cannot be combined with -cmw") catch unreachable,
     clap.parseParam("-m, --create <FILE>... Creates a parity file for specified data file. First argument is data file. Second optional argument is parity file location. Default is [datafilelocation].pars") catch unreachable,
+    clap.parseParam("-r, --recursive    Iterates recursively through directory") catch unreachable,
     clap.parseParam("-t, --target <FILE>    Specifies the target location file name for the parity file. Default is [data_file_name].pars") catch unreachable,
     clap.parseParam("-w, --watch <FILE>    Continuously watch a directory or file and constructs pars files on updates. Cannot be combined with -cim") catch unreachable,
     clap.parseParam("-h, --help             Display this help and exit.") catch unreachable,
@@ -32,7 +33,6 @@ pub fn main() !void {
 
     var diag = clap.Diagnostic{};
     var args = clap.parse(clap.Help, &params, .{ .diagnostic = &diag }) catch |err| {
-        // Report 'Invalid argument [arg]'
         diag.report(std.io.getStdOut().writer(), err) catch {};
         return;
     };
@@ -50,6 +50,8 @@ pub fn main() !void {
     const pars_info = args.option("-i");
     const create_parity_file = args.options("-m");
     const watch_mode = args.option("-w");
+    const recursive = args.flag("-r");
+    const fix = args.flag("-f");
 
     var modes_selected: u8 = 0;
     if (check_file != null) modes_selected += 1;
@@ -76,7 +78,7 @@ pub fn main() !void {
         unreachable;
     }
 
-    try execute_functionality(mode, check_file, pars_info, create_parity_file, watch_mode);
+    try execute_functionality(mode, check_file, pars_info, create_parity_file, watch_mode, fix, recursive);
 }
 
 pub fn print(comptime format_string: []const u8, args: anytype) void {
@@ -91,10 +93,11 @@ fn print_help() !void {
     print("{s}\n", .{slice_stream.getWritten()});
 }
 
-fn execute_functionality(mode: Mode, check_file: ?[]const u8, pars_info: ?[]const u8, create_parity_file: []const []const u8, watch_mode: ?[]const u8) !void{
+fn execute_functionality(mode: Mode, check_file: ?[]const u8, pars_info: ?[]const u8, create_parity_file: []const []const u8, watch_mode: ?[]const u8, do_fix: bool, recursive: bool) !void{
+    _ = recursive;
     switch (mode) {
         .check => {
-            try check_par_file(check_file.?);
+            try check_par_file(check_file.?, do_fix);
         },
         .info => {
             try get_par_file_info(pars_info.?);
@@ -109,8 +112,9 @@ fn execute_functionality(mode: Mode, check_file: ?[]const u8, pars_info: ?[]cons
 
 }
 
-fn check_par_file(check_file: []const u8) !void{
-    _ = check_file;
+fn check_par_file(check_file: []const u8, do_fix: bool) !void{
+    const validation_result = try ecc.validate_pars_file(check_file, do_fix);
+    _ = validation_result;
 }
 
 fn get_par_file_info(pars_info: []const u8) !void {

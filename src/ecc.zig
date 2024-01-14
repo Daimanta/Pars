@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const fs = std.fs;
 const blake3 = std.crypto.hash.Blake3;
 const crc32 = std.hash.Crc32;
@@ -8,6 +9,27 @@ const File = fs.File;
 const Allocator = std.mem.Allocator;
 
 const default_allocator = std.heap.page_allocator;
+
+const ParsIntegrityError = error {
+    MissingMagicBytes,
+    MissingHeader,
+    InconsistentFileSize
+};
+
+const ParsFileError = ParsIntegrityError || fs.File.GetSeekPosError || fs.File.PReadError || std.mem.Allocator.Error;
+const ParsFileAccessError = ParsFileError || std.fs.File.OpenError;
+
+const ValidationResult = struct {
+    ok: bool,
+    parity_file_ok: bool,
+    size_ok: bool,
+    hash_ok: bool,
+    analyzed_blocks: bool,
+    ok_blocks: u64,
+    recoverable_blocks: u64,
+    recovered_blocks: u64,
+    unrecoverable_blocks: u64
+};
 
 const FileHeader = struct {
     file_size: u64,
@@ -24,15 +46,19 @@ const FileHeader = struct {
         return result;
     }
 
-    fn file_size_matches(self: *FileHeader, file_size: usize) bool {
+    fn file_size_expected(self: *FileHeader) usize {
         // Start and end file type marker + header size(without file name length)
         var expected: usize = 4 + 8 + 32 + 4 + 8 + 4 + 2 + 4;
         expected += self.file_name_length;
-        expected += ((self.block_dim * self.block_dim) + 4) * self.full_size_block_count;
+        expected += ((self.block_dim + self.block_dim) + 4) * self.full_size_block_count;
         if (self.last_block_dim > 0) {
-            expected += ((self.last_block_dim * self.last_block_dim) + 4);
+            expected += ((self.last_block_dim + self.last_block_dim) + 4);
         }
-        return expected == file_size;
+        return expected;
+    }
+
+    fn file_size_matches(self: *FileHeader, file_size: usize) bool {
+        return self.file_size_expected() == file_size;
     }
 };
 
@@ -94,34 +120,60 @@ pub fn create_ecc_file_with_dim(dim: u32, file_path: []const u8, target_file_pat
     try create_ecc_file_with_dim_intern(dim, file, file_path, target_file_path);
 }
 
-pub fn validate_pars_file(target_file_path: []const u8, try_fix_data_file: bool) !void {
-    var par_file = try fs.cwd().openFile(target_file_path, .{.mode = .read_only});
-    var header = try get_header_block(par_file);
-    defer default_allocator.free(header.file_name);
+pub fn validate_pars_file(target_file_path: []const u8, try_fix_data_file: bool) !ValidationResult {
+    var ok: bool = true;
+    var parity_file_ok: bool = true;
+    var size_ok: bool = true;
+    var hash_ok: bool = true;
+    var analyzed_blocks: bool = true;
+    var ok_blocks: u64 = 0;
+    var recoverable_blocks: u64 = 0;
+    var recovered_blocks: u64 = 0;
+    var unrecoverable_blocks: u64 = 0;
 
+    var par_file = try fs.cwd().openFile(target_file_path, .{.mode = .read_only});
+    var deallocate_name = true;
+    var header_union = get_header_block(par_file, default_allocator);
+    var header: FileHeader = header_union catch |err| {
+        deallocate_name = false;
+        return err;
+    };
+    defer if (deallocate_name) default_allocator.free(header.file_name);
     const data_file_path = try get_data_file_path(target_file_path, header.file_name);
     defer default_allocator.free(data_file_path);
     var data_file = try fs.cwd().openFile(data_file_path, .{.mode = .read_write});
-
-    if (header.file_size_matches(try par_file.getEndPos())) {
-        return error.ParFileSizeMismatch;
+    if (!header.file_size_matches(try par_file.getEndPos())) {
+        // Header file corrupt, file recovery impossible
+        parity_file_ok = false;
+        ok = false;
+        analyzed_blocks = false;
+        return ValidationResult{.ok = ok, .parity_file_ok = ok, .size_ok = size_ok, .hash_ok = hash_ok, .analyzed_blocks = analyzed_blocks, .ok_blocks = ok_blocks, .recoverable_blocks = recoverable_blocks, .recovered_blocks = recovered_blocks, .unrecoverable_blocks = unrecoverable_blocks};
     }
 
     // If the size is mismatched, any form of matching is potentially difficult
     // Skip for now
     if (try data_file.getEndPos() != header.file_size) {
-        return error.SizeMismatch;
+        size_ok = false;
+        hash_ok = false;
+        ok = false;
+        analyzed_blocks = false;
+        return ValidationResult{.ok = ok, .parity_file_ok = ok, .size_ok = size_ok, .hash_ok = hash_ok, .analyzed_blocks = analyzed_blocks, .ok_blocks = ok_blocks, .recoverable_blocks = recoverable_blocks, .recovered_blocks = recovered_blocks, .unrecoverable_blocks = unrecoverable_blocks};
     }
 
-    var data_file_hash: [16]u8 = undefined;
+    var data_file_hash: [32]u8 = undefined;
     try calculate_blake3_hash(data_file, &data_file_hash);
 
     // If hashes match, data is OK
     if (std.mem.eql(u8, &data_file_hash, &header.blake3_hash)) {
-        return;
+        analyzed_blocks = false;
+        return ValidationResult{.ok = ok, .parity_file_ok = ok, .size_ok = size_ok, .hash_ok = hash_ok, .analyzed_blocks = analyzed_blocks, .ok_blocks = ok_blocks, .recoverable_blocks = recoverable_blocks, .recovered_blocks = recovered_blocks, .unrecoverable_blocks = unrecoverable_blocks};
     }
 
+    hash_ok = false;
+    analyzed_blocks = true;
+
     // We have work to do
+
     try par_file.seekTo(62 + header.file_name_length);
     try data_file.seekTo(0);
 
@@ -143,9 +195,10 @@ pub fn validate_pars_file(target_file_path: []const u8, try_fix_data_file: bool)
     if (header.last_block_dim > 0) {
         try check_block(data_file, par_file, data_block, parity_block, parity_row_match, parity_col_match, header.full_size_block_count, header.block_dim, header.last_block_dim, try_fix_data_file);
     }
+    return ValidationResult{.ok = ok, .parity_file_ok = ok, .size_ok = size_ok, .hash_ok = hash_ok, .analyzed_blocks = analyzed_blocks, .ok_blocks = ok_blocks, .recoverable_blocks = recoverable_blocks, .recovered_blocks = recovered_blocks, .unrecoverable_blocks = unrecoverable_blocks};
 }
 
-pub fn get_pars_file_header(target_file_path: []const u8, allocator: Allocator) !FileHeader {
+pub fn get_pars_file_header(target_file_path: []const u8, allocator: Allocator) ParsFileAccessError!FileHeader {
     var par_file = try fs.cwd().openFile(target_file_path, .{.mode = .read_only});
     return try get_header_block(par_file, allocator);
 }
@@ -285,7 +338,7 @@ fn check_block(data_file: File, par_file: File, data_block: []u8, parity_block: 
     const data_crc = crc32.hash(data_block[0..]);
     const par_crc = extract_u32(parity_block[0..4].*);
     // If parity doesn't match, then the data is not expected(perhaps corrupted)
-    // If parity matches, it might be dumb luck
+    // If parity matches, it might be dumb luck, let's assume things go well for now
     if (data_crc == par_crc) return;
     var col_checks = parity_block[4..4+dim];
     var row_checks = parity_block[4+dim..4+dim+dim];
@@ -382,35 +435,51 @@ fn write_block(file: File, block: FileBlock) !void {
     _ = try file.write(block.row[0..block.dim]);
 }
 
-fn get_header_block(file: File, allocator: Allocator) !FileHeader{
+fn get_header_block(file: File, allocator: Allocator) ParsFileError!FileHeader{
     const fileSize = try file.getEndPos();
-    if (fileSize < 20) {
-        return error.InvalidParsFile;
+    if (fileSize < 4) {
+        return ParsFileError.MissingMagicBytes;
     }
     var file_marker_buffer: [4]u8 = undefined;
     _ = try file.pread(file_marker_buffer[0..], 0);
     if (!std.mem.eql(u8, "PARS", file_marker_buffer[0..])) {
-        return error.InvalidParsFile;
+        return ParsFileError.MissingMagicBytes;
     }
     _ = try file.pread(file_marker_buffer[0..], fileSize - 4);
     if (!std.mem.eql(u8, "SRAP", file_marker_buffer[0..])) {
-        return error.InvalidParsFile;
+        return ParsFileError.MissingMagicBytes;
+    }
+
+    if (fileSize < 62) {
+            return ParsFileError.MissingHeader;
     }
 
     try file.seekTo(0);
     // 46 bytes from starts is all header information except file length
     var header_buffer: [62]u8 = undefined;
     _ = try file.read(header_buffer[0..]);
+
+    const file_size_start: usize = 4;
+    const blake3_start = file_size_start + 8;
+    const block_dim_start = blake3_start + 32;
+    const full_size_block_count_start = block_dim_start + 4;
+    const last_block_dim_start = full_size_block_count_start + 8;
+    const file_name_length_start = last_block_dim_start + 4;
+
     var header: FileHeader = .{
-        .file_size = extract_u64(header_buffer[4..12].*),
+        .file_size = extract_u64(header_buffer[file_size_start..file_size_start+8].*),
         .blake3_hash = undefined,
-        .block_dim = extract_u32(header_buffer[44..48].*),
-        .full_size_block_count = extract_u64(header_buffer[48..56].*),
-        .last_block_dim = extract_u32(header_buffer[56..60].*),
-        .file_name_length = extract_u16(header_buffer[60..62].*),
+        .block_dim = extract_u32(header_buffer[block_dim_start..block_dim_start+4].*),
+        .full_size_block_count = extract_u64(header_buffer[full_size_block_count_start..full_size_block_count_start+8].*),
+        .last_block_dim = extract_u32(header_buffer[last_block_dim_start..last_block_dim_start+4].*),
+        .file_name_length = extract_u16(header_buffer[file_name_length_start..file_name_length_start+2].*),
         .file_name = undefined
     };
-    std.mem.copy(u8, header.blake3_hash[0..], header_buffer[12..44]);
+    std.mem.copy(u8, header.blake3_hash[0..], header_buffer[blake3_start..blake3_start+32]);
+    if (!header.file_size_matches(fileSize)) {
+        return ParsFileError.InconsistentFileSize;
+    }
+
     var file_name = try allocator.alloc(u8, @intCast(header.file_name_length));
     _ = try file.read(file_name[0..]);
     header.file_name = file_name;
@@ -438,10 +507,16 @@ fn extract_u64(input: [8]u8) u64{
 }
 
 fn get_data_file_path(pars_file_path: []const u8, data_file_path: []const u8) ![]u8 {
-    if (data_file_path[0] == '/') {
+    var dir_separator: u8 = '/';
+    if (builtin.os.tag == .windows) {
+        dir_separator = '\\';
+    }
+
+    if (data_file_path[0] == dir_separator) {
         return try default_allocator.dupe(u8, data_file_path);
     }
-    const last_slash_index = std.mem.lastIndexOfScalar(u8, pars_file_path, '/').?;
+
+    const last_slash_index = std.mem.lastIndexOfScalar(u8, pars_file_path, dir_separator).?;
     var result_size = last_slash_index + data_file_path.len + 1;
     var data_file_start_index: usize = 0;
     var result = try default_allocator.alloc(u8, result_size);
