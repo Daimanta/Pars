@@ -10,6 +10,19 @@ const Allocator = std.mem.Allocator;
 
 const default_allocator = std.heap.page_allocator;
 
+const FixIndex = struct {
+    index: usize,
+    value: u8
+};
+
+
+const BlockResult = enum {
+    Ok,
+    Fixable,
+    Fixed,
+    Unfixable
+};
+
 const ParsIntegrityError = error {
     MissingMagicBytes,
     MissingHeader,
@@ -132,6 +145,8 @@ pub fn validate_pars_file(target_file_path: []const u8, try_fix_data_file: bool)
     var unrecoverable_blocks: u64 = 0;
 
     var par_file = try fs.cwd().openFile(target_file_path, .{.mode = .read_only});
+    defer par_file.close();
+
     var deallocate_name = true;
     var header_union = get_header_block(par_file, default_allocator);
     var header: FileHeader = header_union catch |err| {
@@ -177,6 +192,9 @@ pub fn validate_pars_file(target_file_path: []const u8, try_fix_data_file: bool)
     try par_file.seekTo(62 + header.file_name_length);
     try data_file.seekTo(0);
 
+    var fixes = std.ArrayList(FixIndex).init(default_allocator);
+    defer fixes.deinit();
+
     var data_block = try default_allocator.alloc(u8, header.block_dim*header.block_dim);
     var parity_block = try default_allocator.alloc(u8, 2*header.block_dim + 4);
     var parity_col_match = try default_allocator.alloc(u8, header.block_dim);
@@ -189,11 +207,37 @@ pub fn validate_pars_file(target_file_path: []const u8, try_fix_data_file: bool)
 
     var i: u64 = 0;
     while (i < header.full_size_block_count): (i += 1) {
-        try check_block(data_file, par_file, data_block, parity_block, parity_row_match, parity_col_match, i, header.block_dim, header.block_dim, try_fix_data_file);
+        const block_result = try check_block(data_file, par_file, data_block, parity_block, parity_row_match, parity_col_match, i, header.block_dim, header.block_dim, try_fix_data_file, &fixes);
+        if (block_result == .Ok) {
+            ok_blocks += 1;
+        } else if (block_result == .Fixable) {
+            recoverable_blocks += 1;
+        } else if (block_result == .Fixed) {
+            recovered_blocks += 1;
+        } else if (block_result == .Unfixable) {
+            unrecoverable_blocks += 1;
+        }
     }
 
     if (header.last_block_dim > 0) {
-        try check_block(data_file, par_file, data_block, parity_block, parity_row_match, parity_col_match, header.full_size_block_count, header.block_dim, header.last_block_dim, try_fix_data_file);
+        const block_result = try check_block(data_file, par_file, data_block, parity_block, parity_row_match, parity_col_match, header.full_size_block_count, header.block_dim, header.last_block_dim, try_fix_data_file, &fixes);
+        if (block_result == .Ok) {
+            ok_blocks += 1;
+        } else if (block_result == .Fixable) {
+            recoverable_blocks += 1;
+        } else if (block_result == .Fixed) {
+            recovered_blocks += 1;
+        } else if (block_result == .Unfixable) {
+            unrecoverable_blocks += 1;
+        }
+    }
+
+    for (try fixes.toOwnedSlice()) |fix| {
+        _ = try data_file.pwrite(&[1]u8{fix.value}, fix.index);
+    }
+
+    if (unrecoverable_blocks > 0 or recoverable_blocks > 0 or recovered_blocks > 0) {
+        ok = false;
     }
     return ValidationResult{.ok = ok, .parity_file_ok = ok, .size_ok = size_ok, .hash_ok = hash_ok, .analyzed_blocks = analyzed_blocks, .ok_blocks = ok_blocks, .recoverable_blocks = recoverable_blocks, .recovered_blocks = recovered_blocks, .unrecoverable_blocks = unrecoverable_blocks};
 }
@@ -332,14 +376,14 @@ fn create_block(file: File, dim: u32, last_block_dim: u32, buffer: []u8, col_dat
    return result;
 }
 
-fn check_block(data_file: File, par_file: File, data_block: []u8, parity_block: []u8, parity_row_match: []u8, parity_col_match: []u8, block_index: u64, max_dim: u32, dim: u32, try_fix_data_file: bool) !void {
-    _ = try data_file.read(data_block);
+fn check_block(data_file: File, par_file: File, data_block: []u8, parity_block: []u8, parity_row_match: []u8, parity_col_match: []u8, block_index: u64, max_dim: u32, dim: u32, try_fix_data_file: bool, fixes: *std.ArrayList(FixIndex)) !BlockResult {
+    const data_read = try data_file.read(data_block);
     _ = try par_file.read(parity_block);
-    const data_crc = crc32.hash(data_block[0..]);
+    const data_crc = crc32.hash(data_block[0..data_read]);
     const par_crc = extract_u32(parity_block[0..4].*);
     // If parity doesn't match, then the data is not expected(perhaps corrupted)
     // If parity matches, it might be dumb luck, let's assume things go well for now
-    if (data_crc == par_crc) return;
+    if (data_crc == par_crc) return BlockResult.Ok;
     var col_checks = parity_block[4..4+dim];
     var row_checks = parity_block[4+dim..4+dim+dim];
 
@@ -384,7 +428,8 @@ fn check_block(data_file: File, par_file: File, data_block: []u8, parity_block: 
 
     // We have one byte error in a block
     // Restoration should be trivial
-    if (try_fix_data_file and row_errors == 1 and col_errors == 1) {
+    if (row_errors == 1 and col_errors == 1) {
+        if (!try_fix_data_file) return BlockResult.Fixable;
         var fix_row: usize = undefined;
         var fix_column: usize = undefined;
         idx = 0;
@@ -413,9 +458,10 @@ fn check_block(data_file: File, par_file: File, data_block: []u8, parity_block: 
             }
         }
 
-        _ = try data_file.pwrite(&[1]u8{corrected_value}, absolute_index);
+        try fixes.append(FixIndex{.index = absolute_index, .value = corrected_value});
+        return BlockResult.Fixed;
     }
-
+    return BlockResult.Unfixable;
 }
 
 fn write_header(file: File, header: FileHeader) !void {

@@ -114,7 +114,26 @@ fn execute_functionality(mode: Mode, check_file: ?[]const u8, pars_info: ?[]cons
 
 fn check_par_file(check_file: []const u8, do_fix: bool) !void{
     const validation_result = try ecc.validate_pars_file(check_file, do_fix);
-    _ = validation_result;
+    if (validation_result.ok) {
+        print("{s}: ok\n", .{check_file});
+    } else {
+        if (!validation_result.size_ok) {
+            print("{s}: file corrupt, size changed, recovery impossible\n", .{check_file});
+        } else if (validation_result.unrecoverable_blocks > 0) {
+            if (validation_result.recoverable_blocks > 0) {
+                print("{s}: file corrupt, found {d} unrecoverable blocks and {d} recoverable blocks\n", .{check_file, validation_result.unrecoverable_blocks, validation_result.recovered_blocks});
+            } else if (validation_result.recovered_blocks > 0) {
+                print("{s}: file corrupt, found {d} unrecoverable blocks and recovered {d} blocks\n", .{check_file, validation_result.unrecoverable_blocks, validation_result.recovered_blocks});
+            } else {
+                print("{s}: file corrupt, found {d} unrecoverable blocks\n", .{check_file, validation_result.unrecoverable_blocks});
+            }
+        } else if (validation_result.recoverable_blocks > 0) {
+            print("{s}: file corrupt, recovery possible, found {d} corrupt but recoverable blocks\n", .{check_file, validation_result.recoverable_blocks});
+        } else {
+            // If we land here, we must have recovered blocks
+            print("{s}: {d} corrupt blocks found, all recovered", .{check_file, validation_result.recovered_blocks});
+        }
+    }
 }
 
 fn get_par_file_info(pars_info: []const u8) !void {
