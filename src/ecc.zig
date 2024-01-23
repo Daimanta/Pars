@@ -154,9 +154,13 @@ pub fn validate_pars_file(target_file_path: []const u8, try_fix_data_file: bool)
         return err;
     };
     defer if (deallocate_name) default_allocator.free(header.file_name);
+
     const data_file_path = try get_data_file_path(target_file_path, header.file_name);
     defer default_allocator.free(data_file_path);
+
     var data_file = try fs.cwd().openFile(data_file_path, .{.mode = .read_write});
+    defer data_file.close();
+
     if (!header.file_size_matches(try par_file.getEndPos())) {
         // Header file corrupt, file recovery impossible
         parity_file_ok = false;

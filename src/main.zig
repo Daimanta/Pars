@@ -1,7 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const clap = @import("clap.zig");
 const ecc = @import("ecc.zig");
+const strings = @import("util/strings.zig");
 const version = @import("version.zig");
 
 const default_allocator = std.heap.page_allocator;
@@ -19,8 +21,8 @@ const params = [_]clap.Param(clap.Help){
     clap.parseParam("-f, --fix     Try to fix data errors found in data files based on parity files. Only works when checking a file. Default: false") catch unreachable,
     clap.parseParam("-i, --info <FILE>     Gets header statistics from a parity file. Cannot be combined with -cmw") catch unreachable,
     clap.parseParam("-m, --create <FILE>... Creates a parity file for specified data file. First argument is data file. Second optional argument is parity file location. Default is [datafilelocation].pars") catch unreachable,
-    clap.parseParam("-r, --recursive    Iterates recursively through directory") catch unreachable,
-    clap.parseParam("-t, --target <FILE>    Specifies the target location file name for the parity file. Default is [data_file_name].pars") catch unreachable,
+    clap.parseParam("-r, --recursive    Iterates recursively through directory. Cannot be combined with -iw") catch unreachable,
+    clap.parseParam("-t, --target <FILE>    Specifies the target location file name for the parity file, either relative or absolute. Default is [data_file_name].pars") catch unreachable,
     clap.parseParam("-w, --watch <FILE>    Continuously watch a directory or file and constructs pars files on updates. Cannot be combined with -cim") catch unreachable,
     clap.parseParam("-h, --help             Display this help and exit.") catch unreachable,
     clap.parseParam("-v, --version     Display the version number and exit.") catch unreachable,
@@ -64,6 +66,11 @@ pub fn main() !void {
         return;
     }
 
+    if (recursive and (pars_info != null or watch_mode != null)) {
+        print("-r cannot be combined with -iw\n. Exiting.", .{});
+        return;
+    }
+
     var mode: Mode = undefined;
 
     if (check_file != null) {
@@ -94,16 +101,30 @@ fn print_help() !void {
 }
 
 fn execute_functionality(mode: Mode, check_file: ?[]const u8, pars_info: ?[]const u8, create_parity_file: []const []const u8, watch_mode: ?[]const u8, do_fix: bool, recursive: bool) !void{
-    _ = recursive;
     switch (mode) {
         .check => {
-            try check_par_file(check_file.?, do_fix);
+            if (recursive) {
+                try recurse_check_files(check_file.?, do_fix);
+            } else {
+                try check_par_file(check_file.?, do_fix);
+            }
         },
         .info => {
             try get_par_file_info(pars_info.?);
         },
         .create => {
-            try do_create_parity_file(create_parity_file);
+            const data_location = create_parity_file[0];
+            var relative_par_location: ?[]const u8 = null;
+            if (create_parity_file.len > 1) {
+                relative_par_location = create_parity_file[1];
+            }
+
+            if (recursive) {
+                try recurse_create_files(data_location);
+            } else {
+                try do_create_parity_file(data_location, relative_par_location);
+            }
+
         },
         .watch => {
             try run_in_watch_mode(watch_mode.?);
@@ -112,8 +133,105 @@ fn execute_functionality(mode: Mode, check_file: ?[]const u8, pars_info: ?[]cons
 
 }
 
+fn recurse_check_files(dir: []const u8, do_fix: bool) !void{
+    var it_dir = std.fs.cwd().openIterableDir(dir, .{}) catch |err|{
+        print("{any}", .{err});
+        return;
+    };
+    defer it_dir.close();
+
+    var walker = try it_dir.walk(default_allocator);
+    defer walker.deinit();
+
+
+    var buffer: [4096]u8 = undefined;
+    var stringBuilder = strings.StringBuilder.init(buffer[0..]);
+
+
+    var dir_separator: u8 = '/';
+    if (builtin.os.tag == .windows) {
+        dir_separator = '\\';
+    }
+
+    while(try walker.next()) |entry| {
+        stringBuilder.reset();
+        stringBuilder.append(dir);
+
+        if (stringBuilder.toSlice()[stringBuilder.toSlice().len - 1] != dir_separator) {
+            stringBuilder.append(&[1]u8{dir_separator});
+        }
+
+        stringBuilder.append(entry.path);
+
+        if (std.mem.endsWith(u8, stringBuilder.toSlice(), ".pars")) {
+            check_par_file(stringBuilder.toSlice(), do_fix) catch |err| {
+                //TODO: Handle errors
+                std.debug.print("{any}\n", .{err});
+            };
+        }
+
+    }
+}
+
+fn recurse_create_files(dir: []const u8) !void {
+    var it_dir = std.fs.cwd().openIterableDir(dir, .{}) catch |err|{
+            print("{any}", .{err});
+            return;
+        };
+        defer it_dir.close();
+
+        var walker = try it_dir.walk(default_allocator);
+        defer walker.deinit();
+
+
+        var buffer: [4096]u8 = undefined;
+        var stringBuilder = strings.StringBuilder.init(buffer[0..]);
+
+
+        var dir_separator: u8 = '/';
+        if (builtin.os.tag == .windows) {
+            dir_separator = '\\';
+        }
+
+        while(try walker.next()) |entry| {
+            stringBuilder.reset();
+            stringBuilder.append(dir);
+
+            if (stringBuilder.toSlice()[stringBuilder.toSlice().len - 1] != dir_separator) {
+                stringBuilder.append(&[1]u8{dir_separator});
+            }
+
+            stringBuilder.append(entry.path);
+
+            const target = stringBuilder.toSlice();
+
+            if (!std.mem.endsWith(u8, target, ".pars")) {
+                const stat = std.fs.cwd().statFile(target) catch {
+                    continue;
+                };
+                if (stat.kind != .file) {
+                    continue;
+                }
+                do_create_parity_file(target, null) catch |err| {
+                    //TODO: Handle errors
+                    std.debug.print("{any}\n", .{err});
+                };
+            }
+
+        }
+}
+
 fn check_par_file(check_file: []const u8, do_fix: bool) !void{
-    const validation_result = try ecc.validate_pars_file(check_file, do_fix);
+    const validation_result = ecc.validate_pars_file(check_file, do_fix) catch |err| {
+        switch (err) {
+            error.IsDir => {print("File must not be a directory\n", .{});},
+            error.AccessDenied => {print("Access denied\n", .{});},
+            else => {
+                print("Other error: {any}", .{err});
+            }
+        }
+        return;
+    };
     if (validation_result.ok) {
         print("{s}: ok\n", .{check_file});
     } else {
@@ -143,19 +261,12 @@ fn get_par_file_info(pars_info: []const u8) !void {
     print("File name: {s}\nFile Size: {d}\nBlake 3 hash: {s}\nBlock dimension: {d}\nNumber of full size blocks: {d}\nLast block dimension: {d}\n", .{file_header.file_name, file_header.file_size, blake3_string, file_header.block_dim, file_header.full_size_block_count, file_header.last_block_dim});
 }
 
-fn do_create_parity_file(parity_file: []const []const u8) !void {
-    if (parity_file.len == 0 or parity_file.len > 2) {
-        return error.AtLeastOneFileRequired;
-    }
-    if (parity_file.len == 1) {
-        try ecc.create_ecc_file_with_datausage(0.01, parity_file[0], null);
-    } else {
-        try ecc.create_ecc_file_with_datausage(0.01, parity_file[0], parity_file[1]);
-    }
+fn do_create_parity_file(data_file: []const u8, relative_parity_file_location: ?[]const u8) !void {
+    try ecc.create_ecc_file_with_datausage(0.01, data_file, relative_parity_file_location);
 }
 
-fn run_in_watch_mode(watch_mode: []const u8) ! void {
-    _ = watch_mode;
+fn run_in_watch_mode(file: []const u8) ! void {
+    _ = file;
 }
 
 fn blake_3_as_string(bytes: [32]u8, output: *[64]u8) void{
