@@ -89,8 +89,8 @@ pub fn main() !void {
         return;
     }
 
-    if (recursive and (pars_info != null or watch_mode != null)) {
-        print("-r cannot be combined with -iw\n. Exiting.", .{});
+    if (recursive and pars_info != null) {
+        print("-r cannot be combined with -i\n. Exiting.", .{});
         return;
     }
 
@@ -149,7 +149,7 @@ fn execute_functionality(mode: Mode, check_file: ?[]const u8, pars_info: ?[]cons
             }
         },
         .watch => {
-            try run_in_watch_mode(watch_mode.?);
+            try run_in_watch_mode(watch_mode.?, recursive);
         },
     }
 }
@@ -167,20 +167,8 @@ fn recurse_check_files(dir: []const u8, do_fix: bool) !void {
     var buffer: [4096]u8 = undefined;
     var stringBuilder = strings.StringBuilder.init(buffer[0..]);
 
-    var dir_separator: u8 = '/';
-    if (builtin.os.tag == .windows) {
-        dir_separator = '\\';
-    }
-
     while (try walker.next()) |entry| {
-        stringBuilder.reset();
-        stringBuilder.append(dir);
-
-        if (stringBuilder.toSlice()[stringBuilder.toSlice().len - 1] != dir_separator) {
-            stringBuilder.append(&[1]u8{dir_separator});
-        }
-
-        stringBuilder.append(entry.path);
+        concat_dir_and_subpath(&stringBuilder, dir, entry.path);
 
         if (std.mem.endsWith(u8, stringBuilder.toSlice(), ".pars")) {
             check_par_file(stringBuilder.toSlice(), do_fix) catch |err| {
@@ -284,18 +272,68 @@ fn do_create_parity_file(data_file: []const u8, relative_parity_file_location: ?
     try ecc.create_ecc_file_with_datausage(0.01, data_file, relative_parity_file_location);
 }
 
-fn run_in_watch_mode(file: []const u8) !void {
+fn run_in_watch_mode(file: []const u8, recursive: bool) !void {
     var buffer: [4096]u8 = undefined;
+
+    var string_buffer: [4096]u8 = undefined;
+    var stringBuilder = strings.StringBuilder.init(string_buffer[0..]);
+
     var file_descriptor = try std.os.inotify_init1(0);
-    var watch_decriptor = try std.os.inotify_add_watch(file_descriptor, file, IN_CLOSE_WRITE);
-    _ = watch_decriptor;
-    const read_size = try std.os.read(file_descriptor, buffer[0..]);
-    _ = read_size;
-    const short_inotify_len = @sizeOf(std.os.linux.inotify_event);
-    var subslice = buffer[0..short_inotify_len];
-    var short_inotify: *align(1) std.os.linux.inotify_event = @ptrCast(subslice);
-    std.debug.print("{any}\n", .{short_inotify.*});
-    std.debug.print("{s}\n", .{buffer[short_inotify_len .. short_inotify_len + short_inotify.len]});
+    _ = try std.os.inotify_add_watch(file_descriptor, file, IN_CLOSE_WRITE);
+    if (recursive) {
+        var it_dir = std.fs.cwd().openIterableDir(file, .{}) catch |err| {
+            print("{any}", .{err});
+            return;
+        };
+        defer it_dir.close();
+
+        var walker = try it_dir.walk(default_allocator);
+        defer walker.deinit();
+
+        while (try walker.next()) |entry| {
+            concat_dir_and_subpath(&stringBuilder, file, entry.path);
+            const target = stringBuilder.toSlice();
+
+            const stat = std.fs.cwd().statFile(target) catch {
+                continue;
+            };
+            if (stat.kind == .directory) {
+                const ref = try std.os.inotify_add_watch(file_descriptor, target, IN_CLOSE_WRITE);
+                std.debug.print("{d}\n", .{ref});
+            }
+        }
+    }
+
+    print("Started watching '{s}'. Press Control-C to exit application.\n", .{file});
+    while (true) {
+        const read_size = try std.os.read(file_descriptor, buffer[0..]);
+        _ = read_size;
+        const short_inotify_len = @sizeOf(std.os.linux.inotify_event);
+        var subslice = buffer[0..short_inotify_len];
+        var short_inotify: *align(1) std.os.linux.inotify_event = @ptrCast(subslice);
+        const file_name_padded: [:0]u8 = @ptrCast(buffer[short_inotify_len .. short_inotify_len + short_inotify.len]);
+        const end = std.mem.indexOfSentinel(u8, 0, file_name_padded);
+        const file_name = file_name_padded[0..end];
+        std.debug.print("{d} {s}\n", .{short_inotify.wd, file_name});
+        do_create_parity_file(file_name, null) catch |err| {
+            print("{any}\n", .{err});
+        };
+    }
+}
+
+fn concat_dir_and_subpath(stringBuilder: *strings.StringBuilder, dir: []const u8, subPath: []const u8) void {
+    var dir_separator: u8 = '/';
+    if (builtin.os.tag == .windows) {
+        dir_separator = '\\';
+    }
+    stringBuilder.reset();
+    stringBuilder.append(dir);
+
+    if (stringBuilder.toSlice()[stringBuilder.toSlice().len - 1] != dir_separator) {
+        stringBuilder.append(&[1]u8{dir_separator});
+    }
+
+    stringBuilder.append(subPath);
 }
 
 fn blake_3_as_string(bytes: [32]u8, output: *[64]u8) void {
