@@ -10,6 +10,11 @@ const default_allocator = std.heap.page_allocator;
 
 const Mode = enum { check, info, create, watch };
 
+const DirReference = struct {
+    id: i32,
+    name: []const u8
+};
+
 const IN_ACCESS = 0x00000001;
 const IN_MODIFY = 0x00000002;
 const IN_ATTRIB = 0x00000004;
@@ -279,7 +284,13 @@ fn run_in_watch_mode(file: []const u8, recursive: bool) !void {
     var stringBuilder = strings.StringBuilder.init(string_buffer[0..]);
 
     var file_descriptor = try std.os.inotify_init1(0);
-    _ = try std.os.inotify_add_watch(file_descriptor, file, IN_CLOSE_WRITE);
+    const main_ref = try std.os.inotify_add_watch(file_descriptor, file, IN_CLOSE_WRITE);
+
+    var referenceList = std.ArrayList(DirReference).init(default_allocator);
+    defer referenceList.deinit();
+
+    try referenceList.append(DirReference{.id = main_ref, .name = try default_allocator.dupe(u8, file)});
+
     if (recursive) {
         var it_dir = std.fs.cwd().openIterableDir(file, .{}) catch |err| {
             print("{any}", .{err});
@@ -299,10 +310,13 @@ fn run_in_watch_mode(file: []const u8, recursive: bool) !void {
             };
             if (stat.kind == .directory) {
                 const ref = try std.os.inotify_add_watch(file_descriptor, target, IN_CLOSE_WRITE);
-                std.debug.print("{d}\n", .{ref});
+                const name_dupe = try default_allocator.dupe(u8, target);
+                try referenceList.append(DirReference{.id = ref, .name = name_dupe});
             }
         }
     }
+
+    const references = try referenceList.toOwnedSlice();
 
     print("Started watching '{s}'. Press Control-C to exit application.\n", .{file});
     while (true) {
@@ -314,10 +328,22 @@ fn run_in_watch_mode(file: []const u8, recursive: bool) !void {
         const file_name_padded: [:0]u8 = @ptrCast(buffer[short_inotify_len .. short_inotify_len + short_inotify.len]);
         const end = std.mem.indexOfSentinel(u8, 0, file_name_padded);
         const file_name = file_name_padded[0..end];
-        std.debug.print("{d} {s}\n", .{short_inotify.wd, file_name});
-        do_create_parity_file(file_name, null) catch |err| {
-            print("{any}\n", .{err});
-        };
+
+        if (std.mem.endsWith(u8, file_name, ".pars")) {
+            continue;
+        }
+
+        for (references) |ref| {
+            if (ref.id == short_inotify.wd) {
+                concat_dir_and_subpath(&stringBuilder, ref.name, file_name);
+                const file_location = stringBuilder.toSlice();
+                do_create_parity_file(file_location, null) catch |err| {
+                    print("{any}\n", .{err});
+                };
+                print("Created pars file for '{s}'\n", .{file_location});
+                break;
+            }
+        }
     }
 }
 
