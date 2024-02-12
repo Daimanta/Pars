@@ -10,6 +10,13 @@ const default_allocator = std.heap.page_allocator;
 
 const Mode = enum { check, info, create, watch };
 
+const CreationType = enum { count, datausage, coverage, dimension };
+const CreationMode = struct {
+    creationType: CreationType,
+    int_val: u64 = 0,
+    float_val: f64 = 0.0
+};
+
 const DirReference = struct {
     id: i32,
     name: []const u8
@@ -50,9 +57,13 @@ const params = [_]clap.Param(clap.Help){
     clap.parseParam("-f, --fix     Try to fix data errors found in data files based on parity files. Only works when checking a file. Default: false") catch unreachable,
     clap.parseParam("-i, --info <FILE>     Gets header statistics from a parity file. Cannot be combined with -cmw") catch unreachable,
     clap.parseParam("-m, --create <FILE>... Creates a parity file for specified data file. First argument is data file. Second optional argument is parity file location. Default is [datafilelocation].pars") catch unreachable,
-    clap.parseParam("-r, --recursive    Iterates recursively through directory. Cannot be combined with -iw") catch unreachable,
+    clap.parseParam("-r, --recursive    Iterates recursively through directory. Cannot be combined with -i") catch unreachable,
     clap.parseParam("-t, --target <FILE>    Specifies the target location file name for the parity file, either relative or absolute. Default is [data_file_name].pars") catch unreachable,
     clap.parseParam("-w, --watch <FILE>    Continuously watch a directory or file and constructs pars files on updates. Cannot be combined with -cim") catch unreachable,
+    clap.parseParam("--blockcount <INT>    Fixes the number of blocks") catch unreachable,
+    clap.parseParam("--datausage <FLOAT>    Fixes the size of the .pars file relative to the data file. 0<x<=1. Default 0.01") catch unreachable,
+    clap.parseParam("--coverage  <INT>   Guarantee recovery every n bytes.") catch unreachable,
+    clap.parseParam("--dimension <INT>    Fixes the dimension of the block. n >= 2") catch unreachable,
     clap.parseParam("-h, --help             Display this help and exit.") catch unreachable,
     clap.parseParam("-v, --version     Display the version number and exit.") catch unreachable,
 };
@@ -80,8 +91,78 @@ pub fn main() !void {
     const pars_info = args.option("-i");
     const create_parity_file = args.options("-m");
     const watch_mode = args.option("-w");
-    const recursive = args.flag("-r");
+    const recursive = args.flag("-r") and builtin.os.tag == .linux;
     const fix = args.flag("-f");
+
+    const block_count = args.option("--blockcount");
+    const data_usage = args.option("--datausage");
+    const coverage = args.option("--coverage");
+    const dimension = args.option("--dimension");
+
+    var creation_type: CreationType = undefined;
+    var int_val: u64 = 0;
+    var float_val: f64 = 0.0;
+
+    var creation_metric_count: u8 = 0;
+    if (block_count != null) {
+        creation_metric_count += 1;
+        creation_type = .count;
+    }
+    if (data_usage != null) {
+        creation_metric_count += 1;
+        creation_type = .datausage;
+    }
+    if (coverage != null) {
+        creation_metric_count += 1;
+        creation_type = .coverage;
+    }
+    if (dimension != null) {
+        creation_metric_count += 1;
+        creation_type = .dimension;
+    }
+
+    if (creation_metric_count > 1) {
+        print("Only one metric is allowed for choosing pars file size, {d} were chosen\n", .{creation_metric_count});
+        std.os.exit(1);
+    }
+
+    var block_count_int = get_int_from_string(block_count) catch {
+        print("Error converting string to int.\n", .{});
+        std.os.exit(1);
+    };
+    if (block_count_int != null) {
+        int_val = block_count_int.?;
+    }
+
+    var data_usage_float = get_float_from_string(data_usage) catch {
+        print("Error converting string to float.\n", .{});
+        std.os.exit(1);
+    };
+    if (data_usage_float != null) {
+        float_val = data_usage_float.?;
+    }
+
+    var coverage_int: ?u64 = get_int_from_string(coverage) catch {
+        print("Error converting string to int.\n", .{});
+        std.os.exit(1);
+    };
+    if (coverage_int != null) {
+        int_val = coverage_int.?;
+    }
+
+    var dimension_int: ?u64 = get_int_from_string(dimension) catch {
+        print("Error converting string to int.\n", .{});
+        std.os.exit(1);
+    };
+    if (dimension_int != null) {
+        int_val = dimension_int.?;
+    }
+
+    var creationMode = CreationMode{
+        .creationType = creation_type,
+        .int_val = int_val,
+        .float_val = float_val
+    };
 
     var modes_selected: u8 = 0;
     if (check_file != null) modes_selected += 1;
@@ -96,7 +177,7 @@ pub fn main() !void {
 
     if (recursive and pars_info != null) {
         print("-r cannot be combined with -i\n. Exiting.", .{});
-        return;
+        std.os.exit(1);
     }
 
     var mode: Mode = undefined;
@@ -113,7 +194,7 @@ pub fn main() !void {
         unreachable;
     }
 
-    try execute_functionality(mode, check_file, pars_info, create_parity_file, watch_mode, fix, recursive);
+    try execute_functionality(mode, check_file, pars_info, create_parity_file, watch_mode, fix, recursive, creationMode);
 }
 
 pub fn print(comptime format_string: []const u8, args: anytype) void {
@@ -128,7 +209,7 @@ fn print_help() !void {
     print("{s}\n", .{slice_stream.getWritten()});
 }
 
-fn execute_functionality(mode: Mode, check_file: ?[]const u8, pars_info: ?[]const u8, create_parity_file: []const []const u8, watch_mode: ?[]const u8, do_fix: bool, recursive: bool) !void {
+fn execute_functionality(mode: Mode, check_file: ?[]const u8, pars_info: ?[]const u8, create_parity_file: []const []const u8, watch_mode: ?[]const u8, do_fix: bool, recursive: bool, creation_mode: CreationMode) !void {
     switch (mode) {
         .check => {
             if (recursive) {
@@ -148,13 +229,15 @@ fn execute_functionality(mode: Mode, check_file: ?[]const u8, pars_info: ?[]cons
             }
 
             if (recursive) {
-                try recurse_create_files(data_location);
+                try recurse_create_files(data_location, creation_mode);
             } else {
-                try do_create_parity_file(data_location, relative_par_location);
+                try do_create_parity_file(data_location, relative_par_location, creation_mode);
             }
         },
-        .watch => {
-            try run_in_watch_mode(watch_mode.?, recursive);
+        .watch=> {
+            if (builtin.os.tag == .linux) {
+                try run_in_watch_mode(watch_mode.?, recursive, creation_mode);
+            }
         },
     }
 }
@@ -184,7 +267,7 @@ fn recurse_check_files(dir: []const u8, do_fix: bool) !void {
     }
 }
 
-fn recurse_create_files(dir: []const u8) !void {
+fn recurse_create_files(dir: []const u8, creation_mode: CreationMode) !void {
     var it_dir = std.fs.cwd().openIterableDir(dir, .{}) catch |err| {
         print("{any}", .{err});
         return;
@@ -221,7 +304,7 @@ fn recurse_create_files(dir: []const u8) !void {
             if (stat.kind != .file) {
                 continue;
             }
-            do_create_parity_file(target, null) catch |err| {
+            do_create_parity_file(target, null, creation_mode) catch |err| {
                 //TODO: Handle errors
                 std.debug.print("{any}\n", .{err});
             };
@@ -273,7 +356,8 @@ fn get_par_file_info(pars_info: []const u8) !void {
     print("File name: {s}\nFile Size: {d}\nBlake 3 hash: {s}\nBlock dimension: {d}\nNumber of full size blocks: {d}\nLast block dimension: {d}\n", .{ file_header.file_name, file_header.file_size, blake3_string, file_header.block_dim, file_header.full_size_block_count, file_header.last_block_dim });
 }
 
-fn do_create_parity_file(data_file: []const u8, relative_parity_file_location: ?[]const u8) !void {
+fn do_create_parity_file(data_file: []const u8, relative_parity_file_location: ?[]const u8, creation_mode: CreationMode) !void {
+    _ = creation_mode;
     try ecc.create_ecc_file_with_datausage(0.01, data_file, relative_parity_file_location);
 }
 
@@ -360,6 +444,20 @@ fn concat_dir_and_subpath(stringBuilder: *strings.StringBuilder, dir: []const u8
     }
 
     stringBuilder.append(subPath);
+}
+
+fn get_int_from_string(str: ?[]const u8) !?u64{
+    if (str == null) {
+        return null;
+    }
+    return try std.fmt.parseInt(u64, str.?, 10);
+}
+
+fn get_float_from_string(str: ?[]const u8) !?f64 {
+    if (str == null) {
+        return null;
+    }
+    return try std.fmt.parseFloat(f64, str.?);
 }
 
 fn blake_3_as_string(bytes: [32]u8, output: *[64]u8) void {
