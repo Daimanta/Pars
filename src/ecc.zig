@@ -99,7 +99,7 @@ pub fn create_ecc_file_with_block_count(count: u64, file_path: []const u8, targe
     const size = try file.getEndPos();
     const block_size: usize = size / count;
     const target_dim = get_smallest_dim_to_contain_size(block_size);
-    create_ecc_file_with_dim_intern(target_dim, file, file_path, target_file_path);
+    try create_ecc_file_with_dim_intern(target_dim, file, file_path, target_file_path);
 }
 
 pub fn create_ecc_file_with_datausage(usage: f32, file_path: []const u8, target_file_path: ?[]const u8) !void {
@@ -115,15 +115,9 @@ pub fn create_ecc_file_with_datausage(usage: f32, file_path: []const u8, target_
     try create_ecc_file_with_dim(target_dim, file_path, target_file_path);
 }
 
-pub fn create_ecc_file_with_coverage(coverage: f32, file_path: []const u8, target_file_path: ?[]const u8) !void {
-    if (coverage <= 0.0) {
-        return error.CoverageMustBePositive;
-    }
-    if (coverage > 1.0) {
-        return error.CoverageMustNotBeLargerThanOne;
-    }
-
-    const target_dim: u32 = @intFromFloat(@ceil(2.0/coverage));
+// Recovery byte every 'coverage' bytes
+pub fn create_ecc_file_with_coverage(coverage: u64, file_path: []const u8, target_file_path: ?[]const u8) !void {
+    const target_dim: u32 = get_smallest_dim_to_contain_size(coverage);
     try create_ecc_file_with_dim(target_dim, file_path, target_file_path);
 }
 

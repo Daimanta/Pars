@@ -99,9 +99,9 @@ pub fn main() !void {
     const coverage = args.option("--coverage");
     const dimension = args.option("--dimension");
 
-    var creation_type: CreationType = undefined;
+    var creation_type: CreationType = .datausage;
     var int_val: u64 = 0;
-    var float_val: f64 = 0.0;
+    var float_val: f64 = 0.01;
 
     var creation_metric_count: u8 = 0;
     if (block_count != null) {
@@ -357,8 +357,12 @@ fn get_par_file_info(pars_info: []const u8) !void {
 }
 
 fn do_create_parity_file(data_file: []const u8, relative_parity_file_location: ?[]const u8, creation_mode: CreationMode) !void {
-    _ = creation_mode;
-    try ecc.create_ecc_file_with_datausage(0.01, data_file, relative_parity_file_location);
+    switch (creation_mode.creationType) {
+        .count => try ecc.create_ecc_file_with_block_count(creation_mode.int_val, data_file, relative_parity_file_location),
+        .datausage => try ecc.create_ecc_file_with_datausage(@floatCast(creation_mode.float_val), data_file, relative_parity_file_location),
+        .coverage => try ecc.create_ecc_file_with_coverage(creation_mode.int_val, data_file, relative_parity_file_location),
+        .dimension => try ecc.create_ecc_file_with_dim(@intCast(creation_mode.int_val), data_file, relative_parity_file_location),
+    }
 }
 
 fn run_in_watch_mode(file: []const u8, recursive: bool) !void {
